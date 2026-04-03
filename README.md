@@ -6,6 +6,7 @@ Built as a single HTML file with zero dependencies (React loaded from CDN).
 
 ## Features
 
+- **WiFi Scanning** — scan for nearby networks directly through the device, with signal strength and auth mode
 - **WiFi Provisioning** — connect your Solarflow device to WiFi without the Zendure app
 - **MQTT Redirection** — point the device at a local MQTT broker (offline mode) or back to Zendure cloud
 - **Live Telemetry** — real-time dashboard with solar input, battery status, home output, pack data
@@ -63,17 +64,21 @@ sudo dpkg -i cloudflared.deb
 
 ## BLE Protocol
 
-### Connection
+### GATT Service & Characteristics
 
 All Zendure Solarflow devices expose a single BLE GATT service with two characteristics:
 
 ```
 SERVICE:          0000a002-0000-1000-8000-00805f9b34fb
-WRITE (command):  0000c304-0000-1000-8000-00805f9b34fb
-NOTIFY (receive): 0000c305-0000-1000-8000-00805f9b34fb
+WRITE (command):  0000c304-0000-1000-8000-00805f9b34fb  (Handle: 0x002a)
+NOTIFY (receive): 0000c305-0000-1000-8000-00805f9b34fb  (Handle: 0x002c)
 ```
 
-After connecting, the device sends a handshake:
+All communication is JSON over these characteristics. Incoming notifications may be fragmented across multiple BLE packets and need to be reassembled by matching `{` / `}` braces.
+
+### Connection & Handshake
+
+After connecting, the device sends a BLESPP handshake:
 
 ```
 ← {"method":"BLESPP","deviceId":"<DEVICE_ID>"}
@@ -84,16 +89,24 @@ After connecting, the device sends a handshake:
 
 ```json
 → {"messageId":"1","method":"getInfo","timestamp":1234567890}
-← {"messageId":"123","method":"getInfo-rsp","deviceId":"...","deviceSn":"...","modules":[...]}
+← {"messageId":"123","method":"getInfo-rsp","deviceId":"...","sn":"...","modules":[
+     {"module":"MASTER","version":4372},
+     {"module":"AC","version":4381},
+     {"module":"BMS_AB2000","version":4117},
+     {"module":"MPPT","version":4361},
+     {"module":"ESP32","version":4362}
+   ]}
 ```
 
 ### Reading All Properties
 
 ```json
 → {"messageId":"1","deviceId":"<ID>","timestamp":123,"properties":["getAll"],"method":"read"}
-← {"method":"report","deviceId":"...","properties":{...}}   // multiple messages
+← {"method":"report","deviceId":"...","properties":{...}}   // multiple messages follow
 ← {"method":"report","deviceId":"...","packData":[...]}     // battery pack data
 ```
+
+The device streams telemetry reports every ~5 seconds while the BLE connection is active.
 
 ### Writing Properties
 
@@ -104,13 +117,54 @@ Used for changing settings like output limit, SoC bounds, etc:
 ← {"method":"report","success":1,"deviceId":"...","properties":{"outputLimit":300}}
 ```
 
-Note: a successful write echoes the property back. If `properties` is empty `{}`, the device didn't recognize the property name.
+A successful write echoes the property back with `success:1`. If `properties` is empty `{}`, the device didn't recognize the property name.
 
-### WiFi Provisioning (token method)
+### WiFi Provisioning
 
-This is the critical command for connecting the device to WiFi. The exact format was reverse-engineered from Wireshark captures of the Zendure app.
+The WiFi provisioning protocol was reverse-engineered from Wireshark captures of the Zendure app's BLE traffic (Android HCI snoop log). It consists of two steps: scanning for networks, then sending credentials.
 
-**Important**: the Zendure app uses `Write Request` (opcode 0x12, with response), not `Write Command` (opcode 0x52, without response). Some older documentation incorrectly suggests write-without-response.
+#### Step 1: WiFi Scan
+
+The app asks the device to scan for visible WiFi networks:
+
+```json
+→ {"messageId":1001,"method":"WiFi.get"}
+```
+
+The device responds with one or more `WiFi.set` messages containing the scan results, terminated by an empty list:
+
+```json
+← {"messageId":1001,"method":"WiFi.set","WiFi.list":[
+     {"SSID":"MyNetwork","signal":-33,"Primary":1,"AM":7},
+     {"SSID":"FRITZ!Box 7690","signal":-43,"Primary":1,"AM":3},
+     {"SSID":"Neighbor-5G","signal":-69,"Primary":1,"AM":7}
+   ]}
+← {"messageId":1001,"method":"WiFi.set","WiFi.list":[
+     {"SSID":"OtherNetwork","signal":-89,"Primary":6,"AM":3}
+   ]}
+← {"messageId":1001,"method":"WiFi.set","WiFi.list":[]}
+```
+
+**WiFi.list fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `SSID` | string | Network name |
+| `signal` | int (dBm) | Signal strength (negative, higher = better) |
+| `Primary` | int | WiFi channel |
+| `AM` | int | Authentication mode — **critical for provisioning** |
+
+**Known AM values:**
+
+| AM | Likely Meaning |
+|---|---|
+| 3 | WPA / WPA2 mixed |
+| 4 | WPA2-Enterprise or WPA3-transition |
+| 7 | WPA2-PSK |
+
+#### Step 2: Send Credentials (token method)
+
+The app uses `Write Request` (opcode 0x12, with response) to send the credentials:
 
 ```json
 → {
@@ -122,35 +176,45 @@ This is the critical command for connecting the device to WiFi. The exact format
     "password": "<wifi_password>",
     "ssid": "<wifi_ssid>",
     "timeZone": "GMT+01:00",
-    "token": "<16_char_string>"
+    "token": "<random_16_char_string>"
   }
-← {"messageId":30,"productModel":"R3mn8U","method":"Token","result":1}
-  (device disconnects BLE and reboots to join WiFi)
+← {"messageId":1002,"productModel":"R3mn8U","method":"Token","result":0}
 ```
 
-**Fields:**
+The device then disconnects BLE and reboots to join the WiFi network.
+
+**Token command fields:**
 
 | Field | Type | Description |
 |---|---|---|
-| `AM` | int | WiFi authentication mode. `7` = WPA2. **Required for SF800 Pro.** |
-| `homeId` | int | Zendure cloud account/home ID. Negative integer. |
-| `iotUrl` | string | MQTT broker hostname. `mqtteu.zen-iot.com` for EU cloud, `mq.zen-iot.com` for global. For local MQTT, use your broker's IP. Note: EU hostname is `mqtteu` (no hyphen), not `mqtt-eu`. |
-| `messageId` | int | `1002` (convention from the app) |
+| `AM` | int | WiFi authentication mode — **must match the value from the WiFi scan**. Without this field, or with the wrong value, the device returns `result:1` (error) and fails to connect. |
+| `homeId` | int | Zendure cloud account/home ID. Negative integer. Can use a dummy value. |
+| `iotUrl` | string | MQTT broker hostname. See table below. For local MQTT, use your broker's IP address. |
+| `messageId` | int | Convention: `1002` |
 | `method` | string | Must be `"token"` |
 | `password` | string | WiFi password |
 | `ssid` | string | WiFi SSID |
-| `timeZone` | string | Timezone string, e.g. `"GMT+01:00"` |
-| `token` | string | 16-character token string. The app generates a random one per session. |
+| `timeZone` | string | Timezone, e.g. `"GMT+01:00"` |
+| `token` | string | 16-character random string. The app generates a new one per session. |
 
-**The `station` command:**
+**Result codes:**
 
-Some older tools (solarflow-bt-manager, Zendure-HA integration) send a follow-up command:
+| result | Meaning |
+|---|---|
+| `0` | **Success** — device will reboot and connect to WiFi |
+| `1` | **Error** — wrong AM, bad credentials, or missing fields |
+
+> **Important**: Many community tools (solarflow-bt-manager, Zendure-HA) incorrectly interpret `result:1` as success. It is actually an error. The `AM` field from the WiFi scan is required for successful provisioning.
+
+#### The `station` command
+
+Some older tools send a follow-up command after the token:
 
 ```json
 → {"messageId":"1003","method":"station"}
 ```
 
-However, Wireshark captures of the actual Zendure app show it does **not** send this command. The device reboots immediately after accepting the token. The station command may be needed for older Hub 1200/2000 firmware but is not required (and cannot be delivered in time) for the SF800 Pro.
+Wireshark captures of the actual Zendure app show it does **not** send this command for the SF800 Pro. The device reboots immediately after accepting the token (`result:0`). The station command may be relevant for older Hub 1200/2000 firmware.
 
 ### MQTT Cloud Broker Hostnames
 
@@ -159,21 +223,22 @@ However, Wireshark captures of the actual Zendure app show it does **not** send 
 | EU | `mqtteu.zen-iot.com` | 1883 |
 | Global | `mq.zen-iot.com` | 1883 |
 
-Note: some community documentation references `mqtt-eu.zen-iot.com` (with hyphen). The actual app uses `mqtteu.zen-iot.com` (no hyphen).
+> **Note**: Some community documentation references `mqtt-eu.zen-iot.com` (with hyphen). Wireshark captures of the app show the actual hostname is `mqtteu.zen-iot.com` (no hyphen).
+
+### BLE Write Modes
+
+The Zendure app uses **Write Request** (ATT opcode `0x12`, expects a response) for WiFi provisioning commands. Some community tools use Write Command (opcode `0x52`, no response). Both may work for property writes, but WiFi provisioning is more reliable with Write Request.
 
 ## SF800 Pro Telemetry Properties
 
-Properties observed from a SolarFlow 800 Pro (product key `R3mn8U`, firmware MASTER 4372):
+Properties observed from a SolarFlow 800 Pro (product key `R3mn8U`, firmware MASTER 4372, ESP32 4362):
 
 ### Power & Energy
 
 | Property | Type | Description |
 |---|---|---|
 | `solarInputPower` | int (W) | Total solar input |
-| `solarPower1` | int (W) | Panel 1 input |
-| `solarPower2` | int (W) | Panel 2 input |
-| `solarPower3` | int (W) | Panel 3 input |
-| `solarPower4` | int (W) | Panel 4 input |
+| `solarPower1` .. `solarPower4` | int (W) | Per-panel solar input |
 | `outputHomePower` | int (W) | Power output to home/inverter |
 | `outputPackPower` | int (W) | Power charging into batteries |
 | `packInputPower` | int (W) | Power discharging from batteries |
@@ -187,36 +252,37 @@ Properties observed from a SolarFlow 800 Pro (product key `R3mn8U`, firmware MAS
 | `electricLevel` | int (%) | Overall battery percentage |
 | `packState` | int | 0=idle, 1=charging, 2=discharging |
 | `packNum` | int | Number of battery packs |
-| `remainOutTime` | int (min) | Estimated discharge time remaining (59940 = not discharging) |
-| `BatVolt` | int | Battery voltage (raw, divide by 100 for volts) |
+| `remainOutTime` | int (min) | Estimated discharge time (59940 = not discharging) |
+| `BatVolt` | int | Battery voltage (raw) |
 
-### Settings
+### Settings (readable and writable)
 
 | Property | Type | Description |
 |---|---|---|
 | `outputLimit` | int (W) | Output limit to home |
 | `inputLimit` | int (W) | Input limit |
-| `minSoc` | int (‰) | Min SoC, 10x (e.g. 50 = 5%) |
-| `socSet` | int (‰) | Max SoC, 10x (e.g. 1000 = 100%) |
+| `minSoc` | int (‰) | Min SoC, 10x value (e.g. 50 = 5%) |
+| `socSet` | int (‰) | Max SoC, 10x value (e.g. 1000 = 100%) |
 | `inverseMaxPower` | int (W) | Inverter max power setting |
-| `passMode` | int | Bypass mode: 0=auto, 1=off, 2=on |
-| `pass` | int | Current bypass state |
-| `buzzerSwitch` / `lampSwitch` | int | Buzzer/lamp on(1) or off(0) |
 | `chargeMaxLimit` | int (W) | Maximum charge rate |
+| `passMode` | int | Bypass: 0=auto, 1=off, 2=on |
+| `pass` | int | Current bypass state |
+| `buzzerSwitch` | int | Buzzer: 0=off, 1=on |
+| `lampSwitch` | int | LED lamp: 0=off, 1=on |
 | `acMode` | int | AC mode setting |
 | `smartMode` | int | Smart mode setting |
 | `gridReverse` | int | Grid reverse setting |
-| `gridStandard` | int | Grid standard setting |
+| `gridStandard` | int | Grid standard |
 | `gridOffMode` | int | Grid-off mode |
 
-### Status
+### Status (read-only)
 
 | Property | Type | Description |
 |---|---|---|
 | `IOTState` | int | IoT module state (1=active) |
-| `bindstate` | int | Whether device is bound to an account (0=no) |
+| `bindstate` | int | Bound to account (0=no, 1=yes) |
 | `heatState` | int | Heater state |
-| `hyperTmp` | int | Device temperature (deci-Kelvin, convert: (val-2731)/10 = °C) |
+| `hyperTmp` | int | Device temperature (deci-Kelvin: `(val-2731)/10` = °C) |
 | `pvStatus` | int | PV status |
 | `acStatus` | int | AC status |
 | `dcStatus` | int | DC status |
@@ -228,8 +294,17 @@ Properties observed from a SolarFlow 800 Pro (product key `R3mn8U`, firmware MAS
 | `productKey` | string | Product identifier |
 | `deviceKey` | string | Device ID |
 | `MASTER` | int | Master firmware version |
+| `socLimit` | int | SoC limit status |
+| `socStatus` | int | SoC status |
+| `reverseState` | int | Reverse state |
+| `writeRsp` | int | Write response status |
+| `OTAState` | int | OTA update state |
+| `LCNState` | int | LCN state |
+| `factoryModeState` | int | Factory mode state |
 
 ### Battery Pack Data (per pack)
+
+Reported in `packData` arrays within `report` messages:
 
 | Property | Type | Description |
 |---|---|---|
@@ -238,9 +313,9 @@ Properties observed from a SolarFlow 800 Pro (product key `R3mn8U`, firmware MAS
 | `socLevel` | int (%) | Pack charge level |
 | `state` | int | 0=idle, 1=charging, 2=discharging |
 | `power` | int (W) | Pack power |
-| `maxTemp` | int | Max temp (deci-Kelvin: (val-2731)/10 = °C) |
+| `maxTemp` | int | Max temp (deci-Kelvin: `(val-2731)/10` = °C) |
 | `totalVol` | int | Total voltage (raw) |
-| `batcur` | int | Battery current (raw, unsigned) |
+| `batcur` | int | Battery current (raw, unsigned 16-bit) |
 | `maxVol` | int | Max cell voltage |
 | `minVol` | int | Min cell voltage |
 | `softVersion` | int | Pack firmware version |
@@ -248,14 +323,16 @@ Properties observed from a SolarFlow 800 Pro (product key `R3mn8U`, firmware MAS
 
 ## Using with Home Assistant (SF800 Pro)
 
-The SF800 Pro supports the **zenSDK** — a local HTTP API on the device. Once WiFi is provisioned:
+The SF800 Pro supports the **zenSDK** — a local HTTP API running on the device itself. Once WiFi is provisioned:
 
 1. Find the device's IP in your router's DHCP leases
 2. Give it a static IP lease
 3. Block its internet access (router firewall rule)
 4. Control it via HTTP from Home Assistant
 
-See the [community guide for fully local SF800 Pro control](https://community.home-assistant.io/t/zendure-solarflow-800-pro-completely-local-zereo-feed-in-without-cloud-and-even-faster-no-mqtt-no-hacs-easy-mode/980110) for a complete HA package with zero feed-in, seasonal logic, emergency charging, and BMS calibration.
+See the [community guide for fully local SF800 Pro control](https://community.home-assistant.io/t/zendure-solarflow-800-pro-completely-local-zereo-feed-in-without-cloud-and-even-faster-no-mqtt-no-hacs-easy-mode/980110) for a complete HA package with zero feed-in, seasonal logic, emergency charging, and BMS calibration — no MQTT, no HACS, no cloud required.
+
+> **Note**: The SF800 Pro does **not** support the legacy MQTT redirect approach used by older Hubs. Use the zenSDK HTTP API instead.
 
 ## Isolating the Device (OpenWrt)
 
@@ -285,16 +362,21 @@ uci commit firewall
 ### Capturing with Android HCI snoop log
 
 1. Enable Developer Options (tap Build Number 7 times)
-2. Enable "Bluetooth HCI snoop log"
-3. Toggle Bluetooth off/on to start recording
-4. Perform the BLE operation
+2. Settings → Developer Options → enable **"Enable Bluetooth HCI snoop log"**
+3. **Toggle Bluetooth off then on** (critical — starts the log file)
+4. Perform the BLE operation (WiFi provisioning, etc.)
 5. Extract: `adb bugreport capture.zip`
-6. Find `btsnoop_hci.log` in the zip
+6. Find `btsnoop_hci.log` in the zip:
+   ```bash
+   unzip capture.zip -d capture
+   find capture/ -name "*btsnoop*"
+   ```
 
 ### Analyzing with tshark
 
+Extract all BLE writes and notifications with decoded JSON:
+
 ```bash
-# All ATT writes and notifications with decoded JSON
 tshark -r btsnoop_hci.log \
   -Y "btatt.opcode == 0x12 || btatt.opcode == 0x52 || btatt.opcode == 0x1b" \
   -T fields -e frame.number -e frame.time_relative -e btatt.opcode -e btatt.handle -e btatt.value \
@@ -306,12 +388,41 @@ tshark -r btsnoop_hci.log \
 done
 ```
 
+**ATT opcodes:**
+- `0x12` — Write Request (with response, used by the Zendure app)
+- `0x52` — Write Command (without response, used by some community tools)
+- `0x1b` — Handle Value Notification (device → phone)
+
+### Wireshark filters
+
+```
+btatt.value contains "token"     # Find WiFi provisioning
+btatt.value contains "method"    # Find all JSON commands
+btatt.value contains "WiFi"      # Find WiFi scan
+btatt                            # All ATT traffic
+```
+
+## Key Findings from Reverse Engineering
+
+1. **The `AM` field is required** for WiFi provisioning on the SF800 Pro. Without it (or with the wrong value), the device returns `result:1` (error). The correct AM value comes from the device's own WiFi scan (`WiFi.get`).
+
+2. **`result:0` = success, `result:1` = error.** Multiple community tools had this inverted, leading to false "success" reports while WiFi provisioning silently failed.
+
+3. **The EU cloud MQTT hostname is `mqtteu.zen-iot.com`** (no hyphen), not `mqtt-eu.zen-iot.com` as documented elsewhere.
+
+4. **The `station` command is not sent by the Zendure app** for SF800 Pro provisioning. The device reboots immediately after a successful token command.
+
+5. **The Zendure app uses Write Request** (with response, ATT opcode 0x12), not Write Command (without response, 0x52). This matters because the device disconnects very quickly after accepting credentials.
+
+6. **SF800 Pro uses zenSDK** (local HTTP API) instead of the MQTT redirect approach used by legacy Hubs. Once on WiFi, control it via HTTP at its IP address.
+
 ## Credits
 
 - [reinhard-brandstaedter/solarflow-bt-manager](https://github.com/reinhard-brandstaedter/solarflow-bt-manager) — original Python BLE manager, protocol reverse engineering
-- [epicRE/zendure_ble](https://github.com/epicRE/zendure_ble) — BLE protocol documentation
+- [epicRE/zendure_ble](https://github.com/epicRE/zendure_ble) — BLE protocol documentation for Hub 1200
 - [Zendure/Zendure-HA](https://github.com/Zendure/Zendure-HA) — official Home Assistant integration (BLE provisioning reference)
 - [nograx/zendure-cloud-disconnector](https://github.com/nograx/zendure-cloud-disconnector) — Windows BLE disconnector tool
+- WiFi provisioning protocol details captured via Android HCI snoop log + Wireshark analysis of the Zendure app
 
 ## License
 
