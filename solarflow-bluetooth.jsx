@@ -1,19 +1,4 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>Solarflow BT Manager</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
-<style>* { margin:0; padding:0; box-sizing:border-box; } body { background:#0c0f14; }</style>
-</head>
-<body>
-<div id="root"></div>
-<script type="text/babel">
-const { useState, useRef, useCallback } = React;
-
+import { useState, useRef, useCallback } from "react";
 
 const SERVICE_UUID = "0000a002-0000-1000-8000-00805f9b34fb";
 const UUID_NOTIFY  = "0000c305-0000-1000-8000-00805f9b34fb";
@@ -39,7 +24,7 @@ function uid() { return Math.random().toString(16).slice(2,18)+Math.random().toS
 function ts() { return Math.floor(Date.now()/1000); }
 function tempC(raw) { return raw ? ((raw-2731)/10).toFixed(1) : "\u2014"; }
 
-function App() {
+export default function App() {
   const [status, setStatus] = useState("disconnected");
   const [deviceName, setDeviceName] = useState("");
   const [deviceId, setDeviceId] = useState("");
@@ -56,6 +41,8 @@ function App() {
   const [mqttPort, setMqttPort] = useState("1883");
   const [wifiSsid, setWifiSsid] = useState("");
   const [wifiPwd, setWifiPwd] = useState("");
+  const [wifiList, setWifiList] = useState([]);
+  const [wifiScanning, setWifiScanning] = useState(false);
   const [productId, setProductId] = useState("73bkTV");
   const [cloudRegion, setCloudRegion] = useState("eu");
   const [confirmAction, setConfirmAction] = useState(null);
@@ -112,6 +99,23 @@ function App() {
       if (obj.deviceId) { deviceIdRef.current = obj.deviceId; setDeviceId(obj.deviceId); }
       if (obj.deviceSn) setDeviceSn(obj.deviceSn);
       if (obj.firmwares) setFirmwares(obj.firmwares);
+      if (obj.modules) setFirmwares(obj.modules);
+    }
+    if (obj.method === "WiFi.set" && obj["WiFi.list"]) {
+      const list = obj["WiFi.list"];
+      if (list.length > 0) {
+        setWifiList(prev => [...prev, ...list]);
+      } else {
+        setWifiScanning(false);
+        addLog("INFO", "WiFi scan complete");
+      }
+    }
+    if (obj.method === "Token") {
+      if (obj.result === 0) {
+        addLog("INFO", "Token ACCEPTED (result:0) — device will reboot and connect to WiFi!");
+      } else {
+        addLog("ERR", `Token REJECTED (result:${obj.result}) — check SSID, password, and AM value`);
+      }
     }
     if (obj.method === "report" || obj.method === "read_reply") {
       if (obj.properties && typeof obj.properties === "object" && !Array.isArray(obj.properties))
@@ -161,18 +165,30 @@ function App() {
     setStatus("disconnected");
   }, []);
 
-  // --- WiFi/MQTT commands (token + station protocol) ---
-  const sendTokenAndStation = useCallback(async (iotUrl) => {
+  // --- WiFi scan and provisioning (matching Zendure app BLE protocol) ---
+  const sendWifiScan = useCallback(async () => {
+    const char = writeCharRef.current;
+    if (!char) { addLog("ERR","Not connected"); return; }
+    setWifiList([]);
+    setWifiScanning(true);
+    addLog("INFO", "Scanning for WiFi networks...");
+    const cmd = JSON.stringify({ messageId: 1001, method: "WiFi.get" });
+    addLog("TX", cmd);
+    try {
+      await char.writeValueWithResponse(new TextEncoder().encode(cmd));
+    } catch(e) { addLog("ERR", "WiFi scan failed: " + e.message); setWifiScanning(false); }
+  }, [addLog]);
+
+  const sendToken = useCallback(async (iotUrl, am) => {
     if (!wifiSsid||!wifiPwd) { addLog("ERR","WiFi SSID and password required"); return; }
     const char = writeCharRef.current;
     if (!char) { addLog("ERR","Not connected"); return; }
 
-    // Exact format from Wireshark capture of Zendure app:
-    // AM = WiFi auth mode (7 = WPA2)
-    // homeId = cloud account identifier (use a dummy negative int)
-    // No station command needed — device reboots after token
+    // Generate a random 16-char token like the app does
+    const rndToken = Array.from({length:16},()=>"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[Math.random()*62|0]).join("");
+
     const tokenCmd = JSON.stringify({
-      AM: 7,
+      AM: am,
       homeId: -67767571,
       iotUrl,
       messageId: 1002,
@@ -180,18 +196,16 @@ function App() {
       password: wifiPwd,
       ssid: wifiSsid,
       timeZone: "GMT+01:00",
-      token: "Yi9ymf756g5hoY5K"
+      token: rndToken
     });
 
-    addLog("INFO", `Sending token: ssid="${wifiSsid}", iotUrl="${iotUrl}"`);
+    addLog("INFO", `Sending token: ssid="${wifiSsid}", AM=${am}, iotUrl="${iotUrl}"`);
     addLog("TX", tokenCmd);
 
-    // App uses Write Request (with response), not write-without-response
     try {
       await char.writeValueWithResponse(new TextEncoder().encode(tokenCmd));
-      addLog("INFO", "Token accepted. Device should reboot and connect to WiFi.");
+      addLog("INFO", "Write completed — waiting for Token response...");
     } catch(e) {
-      // Device may disconnect before response arrives — that's OK
       addLog("INFO", "Write completed (device may have rebooted): " + e.message);
     }
 
@@ -200,18 +214,23 @@ function App() {
 
   const sendDisconnectFromCloud = useCallback(async () => {
     if (!mqttBroker) { addLog("ERR","MQTT broker address required"); return; }
-    const broker = mqttBroker.includes(":") ? mqttBroker : mqttBroker;
-    await sendTokenAndStation(broker);
-  }, [sendTokenAndStation, mqttBroker]);
+    // Find AM from scan results, default to 7 (WPA2)
+    const net = wifiList.find(n => n.SSID === wifiSsid);
+    const am = net ? net.AM : 7;
+    await sendToken(mqttBroker, am);
+  }, [sendToken, mqttBroker, wifiSsid, wifiList]);
 
   const sendReconnectToCloud = useCallback(async () => {
-    await sendTokenAndStation(CLOUD_BROKERS[cloudRegion]);
-  }, [sendTokenAndStation, cloudRegion]);
+    const net = wifiList.find(n => n.SSID === wifiSsid);
+    const am = net ? net.AM : 7;
+    await sendToken(CLOUD_BROKERS[cloudRegion], am);
+  }, [sendToken, cloudRegion, wifiSsid, wifiList]);
 
   const sendWifiOnly = useCallback(async () => {
-    // Use cloud URL as iotUrl since user just wants WiFi connectivity
-    await sendTokenAndStation(CLOUD_BROKERS[cloudRegion]);
-  }, [sendTokenAndStation, cloudRegion]);
+    const net = wifiList.find(n => n.SSID === wifiSsid);
+    const am = net ? net.AM : 7;
+    await sendToken(CLOUD_BROKERS[cloudRegion], am);
+  }, [sendToken, cloudRegion, wifiSsid, wifiList]);
 
   const sendWrite = useCallback(() => {
     if (!deviceIdRef.current||!writeField||writeValue==="") return;
@@ -273,58 +292,102 @@ function App() {
       {tab==="mqtt" && <div>
         <div style={S.danger}>
           <b>{"\u26A0"} Caution:</b> These commands change where your hub sends data.
-          After sending, <b>power-cycle</b> the hub. You lose app access in offline mode. Use at your own risk.
+          You lose app access in offline mode. Use at your own risk.
         </div>
 
+        {/* WiFi Scan */}
         <div style={S.card}>
-          <div style={S.lbl}>WiFi Credentials</div>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+            <div style={S.lbl}>1. Scan WiFi Networks</div>
+            <button onClick={sendWifiScan} disabled={!isConn||wifiScanning}
+              style={{ ...S.btnPri, opacity:isConn&&!wifiScanning?1:0.4, fontSize:10, padding:"4px 10px" }}>
+              {wifiScanning?"Scanning...":"Scan"}
+            </button>
+          </div>
+          {wifiList.length > 0 && (
+            <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+              {wifiList.sort((a,b)=>a.signal-b.signal).reverse().map((net,i)=>(
+                <button key={i} onClick={()=>{ setWifiSsid(net.SSID); }}
+                  style={{
+                    ...S.btnMut, textAlign:"left", padding:"8px 10px",
+                    background: wifiSsid===net.SSID ? "#1e3a5f" : "#151a23",
+                    border: wifiSsid===net.SSID ? "1px solid #2563eb" : "1px solid #1e293b",
+                    borderRadius:6, display:"flex", justifyContent:"space-between", alignItems:"center",
+                  }}>
+                  <span>
+                    <span style={{ color:"#e2e8f0", fontWeight:wifiSsid===net.SSID?600:400 }}>{net.SSID}</span>
+                    <span style={{ color:"#475569", fontSize:10, marginLeft:8 }}>
+                      AM:{net.AM} ch:{net.Primary}
+                    </span>
+                  </span>
+                  <span style={{ color: net.signal > -50 ? "#4ade80" : net.signal > -70 ? "#facc15" : "#ef4444", fontSize:10 }}>
+                    {net.signal}dBm
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+          {wifiList.length===0 && !wifiScanning && isConn && (
+            <div style={{fontSize:11,color:"#475569"}}>Tap Scan to discover networks visible to the device</div>
+          )}
+        </div>
+
+        {/* WiFi Credentials */}
+        <div style={S.card}>
+          <div style={S.lbl}>2. WiFi Credentials</div>
           <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
-            <input value={wifiSsid} onChange={e=>setWifiSsid(e.target.value)} placeholder="WiFi SSID" style={S.inp}/>
+            <input value={wifiSsid} onChange={e=>setWifiSsid(e.target.value)} placeholder="WiFi SSID (or select above)" style={S.inp}/>
             <input value={wifiPwd} onChange={e=>setWifiPwd(e.target.value)} placeholder="WiFi Password" type="password" style={S.inp}/>
           </div>
         </div>
 
-        {/* WiFi only - no MQTT change */}
+        {/* Connect to WiFi (cloud iotUrl) */}
         <div style={{ ...S.card, borderColor:"#2563eb" }}>
-          <div style={{ ...S.lbl, color:"#60a5fa" }}>Connect to WiFi Only</div>
+          <div style={{ ...S.lbl, color:"#60a5fa" }}>3. Connect to WiFi</div>
           <p style={{ fontSize:11, color:"#94a3b8", margin:"4px 0 8px", lineHeight:1.5 }}>
-            Send WiFi credentials without changing the MQTT server.
-            Use this for newer devices (SF800, Hyper) that support local HTTP (zenSDK) — 
-            just get them on your network, then talk to them over HTTP.
+            Sends WiFi credentials with cloud MQTT endpoint.
+            For SF800/Hyper devices, block internet afterwards and use zenSDK locally.
+            {wifiSsid && wifiList.length > 0 && (() => {
+              const net = wifiList.find(n=>n.SSID===wifiSsid);
+              return net ? <span style={{color:"#4ade80"}}> (AM:{net.AM}, {net.signal}dBm)</span> : <span style={{color:"#f97316"}}> (SSID not in scan — AM will default to 7)</span>;
+            })()}
           </p>
+          <div style={{ marginBottom:8 }}>
+            <div style={{ fontSize:10, color:"#64748b", marginBottom:4 }}>Cloud region (for iotUrl)</div>
+            <div style={{ display:"flex", gap:6 }}>
+              {Object.entries(CLOUD_BROKERS).map(([k,v])=>(
+                <button key={k} onClick={()=>setCloudRegion(k)} style={{
+                  ...S.btnMut, fontSize:10,
+                  background:cloudRegion===k?"#2563eb":"#1e293b",
+                  color:cloudRegion===k?"#fff":"#94a3b8",
+                  fontWeight:cloudRegion===k?600:400,
+                }}>{k.toUpperCase()}: {v}</button>
+              ))}
+            </div>
+          </div>
           {confirmAction!=="wifi"
-            ? <button onClick={()=>setConfirmAction("wifi")} disabled={!isConn}
-                style={{ ...S.btnPri, opacity:isConn?1:0.4 }}>Send WiFi Credentials</button>
+            ? <button onClick={()=>setConfirmAction("wifi")} disabled={!isConn||!wifiSsid||!wifiPwd}
+                style={{ ...S.btnPri, opacity:isConn&&wifiSsid&&wifiPwd?1:0.4 }}>Connect to WiFi</button>
             : <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
-                <span style={{ fontSize:11, color:"#fbbf24" }}>Send WiFi for "{wifiSsid}"?</span>
+                <span style={{ fontSize:11, color:"#fbbf24" }}>Connect "{wifiSsid}"?</span>
                 <button onClick={sendWifiOnly} style={S.btnPri}>Yes, connect</button>
                 <button onClick={()=>setConfirmAction(null)} style={S.btnMut}>Cancel</button>
               </div>}
         </div>
 
-        <div style={S.card}>
-          <div style={S.lbl}>Device Model</div>
-          <select value={productId} onChange={e=>setProductId(e.target.value)} style={S.inp}>
-            {Object.entries(PRODUCT_IDS).map(([k,v])=><option key={k} value={k}>{v} ({k})</option>)}
-          </select>
-        </div>
-
-        {/* Disconnect */}
+        {/* Disconnect from cloud → local MQTT */}
         <div style={{ ...S.card, borderColor:"#991b1b" }}>
           <div style={{ ...S.lbl, color:"#f87171" }}>Go Offline \u2192 Local MQTT</div>
           <p style={{ fontSize:11, color:"#94a3b8", margin:"4px 0 8px", lineHeight:1.5 }}>
-            Redirect the hub to your own MQTT broker.
-            Your broker must allow anonymous auth (the hub uses a hardcoded password).
+            Connect WiFi but point iotUrl at your own MQTT broker instead of cloud.
           </p>
           <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:8 }}>
             <input value={mqttBroker} onChange={e=>setMqttBroker(e.target.value)}
               placeholder="Broker IP (e.g. 192.168.1.100)" style={{ ...S.inp, flex:1, minWidth:170 }}/>
-            <input value={mqttPort} onChange={e=>setMqttPort(e.target.value)}
-              placeholder="Port" style={{ ...S.inp, width:64, flex:"none" }}/>
           </div>
           {confirmAction!=="disconnect"
-            ? <button onClick={()=>setConfirmAction("disconnect")} disabled={!isConn}
-                style={{ ...S.btnDng, opacity:isConn?1:0.4 }}>Disconnect from Cloud</button>
+            ? <button onClick={()=>setConfirmAction("disconnect")} disabled={!isConn||!wifiSsid||!wifiPwd}
+                style={{ ...S.btnDng, opacity:isConn&&wifiSsid&&wifiPwd?1:0.4 }}>Disconnect from Cloud</button>
             : <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
                 <span style={{ fontSize:11, color:"#fbbf24" }}>Hub will go offline. Sure?</span>
                 <button onClick={sendDisconnectFromCloud} style={S.btnDng}>Yes, go offline</button>
@@ -332,40 +395,25 @@ function App() {
               </div>}
         </div>
 
-        {/* Reconnect */}
+        {/* Reconnect to cloud */}
         <div style={{ ...S.card, borderColor:"#166534" }}>
           <div style={{ ...S.lbl, color:"#4ade80" }}>Go Online \u2192 Zendure Cloud</div>
           <p style={{ fontSize:11, color:"#94a3b8", margin:"4px 0 8px", lineHeight:1.5 }}>
             Restore cloud connectivity. Needed for firmware updates and app control.
           </p>
-          <div style={{ marginBottom:8 }}>
-            <div style={{ fontSize:10, color:"#64748b", marginBottom:4 }}>Cloud region</div>
-            <div style={{ display:"flex", gap:6 }}>
-              {Object.entries(CLOUD_BROKERS).map(([k,v])=>(
-                <button key={k} onClick={()=>setCloudRegion(k)} style={{
-                  ...S.btnMut,
-                  background:cloudRegion===k?"#22c55e":"#1e293b",
-                  color:cloudRegion===k?"#0c0f14":"#94a3b8",
-                  fontWeight:cloudRegion===k?600:400,
-                }}>{k.toUpperCase()}: {v}</button>
-              ))}
-            </div>
-          </div>
           {confirmAction!=="reconnect"
-            ? <button onClick={()=>setConfirmAction("reconnect")} disabled={!isConn}
-                style={{ ...S.btnSuc, opacity:isConn?1:0.4 }}>Reconnect to Cloud</button>
+            ? <button onClick={()=>setConfirmAction("reconnect")} disabled={!isConn||!wifiSsid||!wifiPwd}
+                style={{ ...S.btnSuc, opacity:isConn&&wifiSsid&&wifiPwd?1:0.4 }}>Reconnect to Cloud</button>
             : <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
-                <span style={{ fontSize:11, color:"#fbbf24" }}>Confirm reconnect to cloud?</span>
+                <span style={{ fontSize:11, color:"#fbbf24" }}>Confirm reconnect?</span>
                 <button onClick={sendReconnectToCloud} style={S.btnSuc}>Yes, reconnect</button>
                 <button onClick={()=>setConfirmAction(null)} style={S.btnMut}>Cancel</button>
               </div>}
         </div>
 
         <div style={{ fontSize:10, color:"#475569", marginTop:8, lineHeight:1.5 }}>
-          Property names (<code style={{color:"#94a3b8"}}>iotUrl</code>, <code style={{color:"#94a3b8"}}>wifiName</code>, <code style={{color:"#94a3b8"}}>wifiPwd</code>) are based on the{" "}
-          <a href="https://github.com/reinhard-brandstaedter/solarflow-bt-manager" target="_blank" rel="noopener" style={{color:"#60a5fa"}}>solarflow-bt-manager</a> and{" "}
-          <a href="https://github.com/nograx/zendure-cloud-disconnector" target="_blank" rel="noopener" style={{color:"#60a5fa"}}>zendure-cloud-disconnector</a>.
-          Check the Log tab to verify <code style={{color:"#94a3b8"}}>write_reply</code> responses.
+          Protocol reverse-engineered from Wireshark captures of the Zendure app.
+          result:0 = success, result:1 = error. Check the Log tab for responses.
         </div>
       </div>}
 
@@ -641,8 +689,3 @@ const S = {
   danger: { background:"#1c0a0a", border:"1px solid #7f1d1d", borderRadius:6, padding:"8px 12px", marginBottom:12, fontSize:11, color:"#fca5a5", lineHeight:1.5 },
   logBox: { background:"#0f1219", border:"1px solid #1e293b", borderRadius:6, maxHeight:400, overflowY:"auto", padding:8, fontSize:10, fontFamily:"inherit" },
 };
-
-ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
-</script>
-</body>
-</html>

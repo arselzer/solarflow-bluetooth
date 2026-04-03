@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Solarflow BT Manager</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>* { margin:0; padding:0; box-sizing:border-box; } body { background:#0c0f14; }</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useCallback } = React;
+
+
+const SERVICE_UUID = "0000a002-0000-1000-8000-00805f9b34fb";
+const UUID_NOTIFY  = "0000c305-0000-1000-8000-00805f9b34fb";
+const UUID_WRITE   = "0000c304-0000-1000-8000-00805f9b34fb";
+
+const CLOUD_BROKERS = {
+  global: "mq.zen-iot.com",
+  eu: "mqtteu.zen-iot.com",
+};
+
+const PRODUCT_IDS = {
+  "73bkTV": "Hub 1200",
+  "A8yh63": "Hub 2000",
+  "yWF7hV": "AIO 2400",
+  "ja72U0ha": "Hyper 2000",
+  "8bM93H": "ACE 1500",
+  "B1NHMC": "SolarFlow 800",
+};
+
+const PV_BRANDS = ["Other","Hoymiles","Enphase","APsystems","Anker","Deye","BossWerk","Tsun"];
+
+function uid() { return Math.random().toString(16).slice(2,18)+Math.random().toString(16).slice(2,18); }
+function ts() { return Math.floor(Date.now()/1000); }
+function tempC(raw) { return raw ? ((raw-2731)/10).toFixed(1) : "\u2014"; }
+
+function App() {
+  const [status, setStatus] = useState("disconnected");
+  const [deviceName, setDeviceName] = useState("");
+  const [deviceId, setDeviceId] = useState("");
+  const [deviceSn, setDeviceSn] = useState("");
+  const [props, setProps] = useState({});
+  const [packs, setPacks] = useState({});
+  const [firmwares, setFirmwares] = useState([]);
+  const [log, setLog] = useState([]);
+  const [tab, setTab] = useState("mqtt");
+  const [writeField, setWriteField] = useState("outputLimit");
+  const [writeValue, setWriteValue] = useState("");
+
+  const [mqttBroker, setMqttBroker] = useState("");
+  const [mqttPort, setMqttPort] = useState("1883");
+  const [wifiSsid, setWifiSsid] = useState("");
+  const [wifiPwd, setWifiPwd] = useState("");
+  const [wifiList, setWifiList] = useState([]);
+  const [wifiScanning, setWifiScanning] = useState(false);
+  const [productId, setProductId] = useState("73bkTV");
+  const [cloudRegion, setCloudRegion] = useState("eu");
+  const [confirmAction, setConfirmAction] = useState(null);
+
+  const deviceRef = useRef(null);
+  const writeCharRef = useRef(null);
+  const bufferRef = useRef("");
+  const deviceIdRef = useRef("");
+  const handshakeDone = useRef(false);
+
+  const addLog = useCallback((dir, msg) => {
+    setLog(prev => [...prev.slice(-300), { t: new Date().toLocaleTimeString(), dir, msg }]);
+  }, []);
+
+  const bleWrite = useCallback(async (obj) => {
+    const char = writeCharRef.current;
+    if (!char) return;
+    const json = JSON.stringify(obj);
+    addLog("TX", json);
+    const data = new TextEncoder().encode(json);
+    try {
+      await char.writeValueWithoutResponse(data);
+    } catch (e) {
+      try { await char.writeValueWithResponse(data); }
+      catch (e2) { addLog("ERR", "Write failed: " + e2.message); }
+    }
+  }, [addLog]);
+
+  const sendGetInfo = useCallback(() => {
+    bleWrite({ messageId: uid(), method: "getInfo", timestamp: ts() });
+  }, [bleWrite]);
+
+  const sendGetAll = useCallback(() => {
+    if (!deviceIdRef.current) return;
+    bleWrite({ messageId: uid(), deviceId: deviceIdRef.current, timestamp: ts(), properties: ["getAll"], method: "read" });
+  }, [bleWrite]);
+
+  const handleMessage = useCallback((json) => {
+    let obj;
+    try { obj = JSON.parse(json); } catch { return; }
+    addLog("RX", json);
+
+    if (obj.method === "BLESPP" && !handshakeDone.current) {
+      handshakeDone.current = true;
+      if (obj.deviceId) { deviceIdRef.current = obj.deviceId; setDeviceId(obj.deviceId); }
+      bleWrite({ messageId: "1009", method: "BLESPP_OK" }).then(() => {
+        setStatus("connected");
+        setTimeout(sendGetInfo, 300);
+        setTimeout(sendGetAll, 800);
+      });
+      return;
+    }
+    if (obj.method === "getInfo-rsp") {
+      if (obj.deviceId) { deviceIdRef.current = obj.deviceId; setDeviceId(obj.deviceId); }
+      if (obj.deviceSn) setDeviceSn(obj.deviceSn);
+      if (obj.firmwares) setFirmwares(obj.firmwares);
+      if (obj.modules) setFirmwares(obj.modules);
+    }
+    if (obj.method === "WiFi.set" && obj["WiFi.list"]) {
+      const list = obj["WiFi.list"];
+      if (list.length > 0) {
+        setWifiList(prev => [...prev, ...list]);
+      } else {
+        setWifiScanning(false);
+        addLog("INFO", "WiFi scan complete");
+      }
+    }
+    if (obj.method === "Token") {
+      if (obj.result === 0) {
+        addLog("INFO", "Token ACCEPTED (result:0) — device will reboot and connect to WiFi!");
+      } else {
+        addLog("ERR", `Token REJECTED (result:${obj.result}) — check SSID, password, and AM value`);
+      }
+    }
+    if (obj.method === "report" || obj.method === "read_reply") {
+      if (obj.properties && typeof obj.properties === "object" && !Array.isArray(obj.properties))
+        setProps(prev => ({ ...prev, ...obj.properties }));
+      if (obj.packData)
+        for (const p of obj.packData)
+          if (p.sn) setPacks(prev => ({ ...prev, [p.sn]: { ...(prev[p.sn]||{}), ...p } }));
+    }
+    if (obj.method === "write_reply") {
+      if (obj.properties) setProps(prev => ({ ...prev, ...obj.properties }));
+      addLog("INFO", `Write ${obj.success ? "OK" : "FAILED"}: ${JSON.stringify(obj.properties)}`);
+    }
+  }, [addLog, bleWrite, sendGetInfo, sendGetAll]);
+
+  const onNotification = useCallback((event) => {
+    bufferRef.current += new TextDecoder().decode(event.target.value);
+    let buf = bufferRef.current, depth = 0, start = -1;
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i]==='{') { if (!depth) start=i; depth++; }
+      else if (buf[i]==='}') { depth--; if (!depth && start!==-1) { handleMessage(buf.slice(start,i+1)); buf=buf.slice(i+1); i=-1; start=-1; } }
+    }
+    bufferRef.current = buf;
+  }, [handleMessage]);
+
+  const connect = useCallback(async () => {
+    try {
+      setStatus("scanning");
+      handshakeDone.current = false;
+      bufferRef.current = "";
+      const device = await navigator.bluetooth.requestDevice({ filters:[{namePrefix:"Zen"}], optionalServices:[SERVICE_UUID] });
+      deviceRef.current = device;
+      setDeviceName(device.name||"Unknown");
+      setStatus("connecting");
+      device.addEventListener("gattserverdisconnected", () => { setStatus("disconnected"); handshakeDone.current=false; });
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      const notifyChar = await service.getCharacteristic(UUID_NOTIFY);
+      writeCharRef.current = await service.getCharacteristic(UUID_WRITE);
+      await notifyChar.startNotifications();
+      notifyChar.addEventListener("characteristicvaluechanged", onNotification);
+      setStatus("handshaking");
+    } catch(e) { setStatus("disconnected"); addLog("ERR", e.message); }
+  }, [onNotification, addLog]);
+
+  const btDisconnect = useCallback(() => {
+    if (deviceRef.current?.gatt?.connected) deviceRef.current.gatt.disconnect();
+    setStatus("disconnected");
+  }, []);
+
+  // --- WiFi scan and provisioning (matching Zendure app BLE protocol) ---
+  const sendWifiScan = useCallback(async () => {
+    const char = writeCharRef.current;
+    if (!char) { addLog("ERR","Not connected"); return; }
+    setWifiList([]);
+    setWifiScanning(true);
+    addLog("INFO", "Scanning for WiFi networks...");
+    const cmd = JSON.stringify({ messageId: 1001, method: "WiFi.get" });
+    addLog("TX", cmd);
+    try {
+      await char.writeValueWithResponse(new TextEncoder().encode(cmd));
+    } catch(e) { addLog("ERR", "WiFi scan failed: " + e.message); setWifiScanning(false); }
+  }, [addLog]);
+
+  const sendToken = useCallback(async (iotUrl, am) => {
+    if (!wifiSsid||!wifiPwd) { addLog("ERR","WiFi SSID and password required"); return; }
+    const char = writeCharRef.current;
+    if (!char) { addLog("ERR","Not connected"); return; }
+
+    // Generate a random 16-char token like the app does
+    const rndToken = Array.from({length:16},()=>"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[Math.random()*62|0]).join("");
+
+    const tokenCmd = JSON.stringify({
+      AM: am,
+      homeId: -67767571,
+      iotUrl,
+      messageId: 1002,
+      method: "token",
+      password: wifiPwd,
+      ssid: wifiSsid,
+      timeZone: "GMT+01:00",
+      token: rndToken
+    });
+
+    addLog("INFO", `Sending token: ssid="${wifiSsid}", AM=${am}, iotUrl="${iotUrl}"`);
+    addLog("TX", tokenCmd);
+
+    try {
+      await char.writeValueWithResponse(new TextEncoder().encode(tokenCmd));
+      addLog("INFO", "Write completed — waiting for Token response...");
+    } catch(e) {
+      addLog("INFO", "Write completed (device may have rebooted): " + e.message);
+    }
+
+    setConfirmAction(null);
+  }, [addLog, wifiSsid, wifiPwd]);
+
+  const sendDisconnectFromCloud = useCallback(async () => {
+    if (!mqttBroker) { addLog("ERR","MQTT broker address required"); return; }
+    // Find AM from scan results, default to 7 (WPA2)
+    const net = wifiList.find(n => n.SSID === wifiSsid);
+    const am = net ? net.AM : 7;
+    await sendToken(mqttBroker, am);
+  }, [sendToken, mqttBroker, wifiSsid, wifiList]);
+
+  const sendReconnectToCloud = useCallback(async () => {
+    const net = wifiList.find(n => n.SSID === wifiSsid);
+    const am = net ? net.AM : 7;
+    await sendToken(CLOUD_BROKERS[cloudRegion], am);
+  }, [sendToken, cloudRegion, wifiSsid, wifiList]);
+
+  const sendWifiOnly = useCallback(async () => {
+    const net = wifiList.find(n => n.SSID === wifiSsid);
+    const am = net ? net.AM : 7;
+    await sendToken(CLOUD_BROKERS[cloudRegion], am);
+  }, [sendToken, cloudRegion, wifiSsid, wifiList]);
+
+  const sendWrite = useCallback(() => {
+    if (!deviceIdRef.current||!writeField||writeValue==="") return;
+    const val = Number(writeValue); if (isNaN(val)) return;
+    bleWrite({ method:"write", timestamp:ts(), messageId:uid(), deviceId:deviceIdRef.current, properties:{[writeField]:val} });
+  }, [bleWrite, writeField, writeValue]);
+
+  const quickSet = useCallback((field,value) => {
+    if (!deviceIdRef.current) return;
+    bleWrite({ method:"write", timestamp:ts(), messageId:uid(), deviceId:deviceIdRef.current, properties:{[field]:value} });
+  }, [bleWrite]);
+
+  const supported = !!navigator.bluetooth;
+  const SC = { disconnected:"#6b7280", scanning:"#f59e0b", connecting:"#f59e0b", handshaking:"#f59e0b", connected:"#22c55e" };
+  const statusColor = SC[status]||"#6b7280";
+  const packList = Object.values(packs);
+  const isConn = status === "connected";
+
+  return (
+    <div style={S.root}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:12, flexWrap:"wrap" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, flex:1, minWidth:180 }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#facc15" strokeWidth="2.5">
+            <circle cx="12" cy="12" r="4"/><path d="M12 2v3M12 19v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M2 12h3M19 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12"/>
+          </svg>
+          <span style={{ fontSize:15, fontWeight:700, letterSpacing:-0.5 }}>Solarflow BT</span>
+          <span style={{ display:"inline-block", width:7, height:7, borderRadius:"50%", background:statusColor, boxShadow:`0 0 6px ${statusColor}` }}/>
+          <span style={{ fontSize:10, color:"#94a3b8" }}>{status}</span>
+        </div>
+        {status==="disconnected"
+          ? <button onClick={connect} disabled={!supported} style={S.btnPri}>{supported?"Connect":"No Web BT"}</button>
+          : <button onClick={btDisconnect} style={S.btnDng}>Disconnect BLE</button>}
+      </div>
+
+      {!supported && <div style={S.warn}>Web Bluetooth not available. Use Chrome on Android/desktop. iOS: try Bluefy.</div>}
+
+      {deviceId && (
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:8, fontSize:10, color:"#94a3b8" }}>
+          {deviceName && <span>{deviceName}</span>}
+          <span>ID: <b style={{color:"#e2e8f0"}}>{deviceId}</b></span>
+          {deviceSn && <span>SN: {deviceSn}</span>}
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div style={{ display:"flex", gap:0, marginBottom:12, borderBottom:"1px solid #1e293b", overflowX:"auto" }}>
+        {["mqtt","dashboard","settings","log"].map(t => (
+          <button key={t} onClick={()=>setTab(t)} style={{
+            background:tab===t?"#1e293b":"transparent", color:tab===t?"#facc15":"#64748b",
+            border:"none", padding:"6px 12px", cursor:"pointer", fontSize:11,
+            fontFamily:"inherit", fontWeight:tab===t?600:400, whiteSpace:"nowrap",
+            borderBottom:tab===t?"2px solid #facc15":"2px solid transparent",
+          }}>{t==="mqtt"?"WiFi / MQTT":t[0].toUpperCase()+t.slice(1)}</button>
+        ))}
+      </div>
+
+      {/* ===== WiFi / MQTT ===== */}
+      {tab==="mqtt" && <div>
+        <div style={S.danger}>
+          <b>{"\u26A0"} Caution:</b> These commands change where your hub sends data.
+          You lose app access in offline mode. Use at your own risk.
+        </div>
+
+        {/* WiFi Scan */}
+        <div style={S.card}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+            <div style={S.lbl}>1. Scan WiFi Networks</div>
+            <button onClick={sendWifiScan} disabled={!isConn||wifiScanning}
+              style={{ ...S.btnPri, opacity:isConn&&!wifiScanning?1:0.4, fontSize:10, padding:"4px 10px" }}>
+              {wifiScanning?"Scanning...":"Scan"}
+            </button>
+          </div>
+          {wifiList.length > 0 && (
+            <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+              {wifiList.sort((a,b)=>a.signal-b.signal).reverse().map((net,i)=>(
+                <button key={i} onClick={()=>{ setWifiSsid(net.SSID); }}
+                  style={{
+                    ...S.btnMut, textAlign:"left", padding:"8px 10px",
+                    background: wifiSsid===net.SSID ? "#1e3a5f" : "#151a23",
+                    border: wifiSsid===net.SSID ? "1px solid #2563eb" : "1px solid #1e293b",
+                    borderRadius:6, display:"flex", justifyContent:"space-between", alignItems:"center",
+                  }}>
+                  <span>
+                    <span style={{ color:"#e2e8f0", fontWeight:wifiSsid===net.SSID?600:400 }}>{net.SSID}</span>
+                    <span style={{ color:"#475569", fontSize:10, marginLeft:8 }}>
+                      AM:{net.AM} ch:{net.Primary}
+                    </span>
+                  </span>
+                  <span style={{ color: net.signal > -50 ? "#4ade80" : net.signal > -70 ? "#facc15" : "#ef4444", fontSize:10 }}>
+                    {net.signal}dBm
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+          {wifiList.length===0 && !wifiScanning && isConn && (
+            <div style={{fontSize:11,color:"#475569"}}>Tap Scan to discover networks visible to the device</div>
+          )}
+        </div>
+
+        {/* WiFi Credentials */}
+        <div style={S.card}>
+          <div style={S.lbl}>2. WiFi Credentials</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+            <input value={wifiSsid} onChange={e=>setWifiSsid(e.target.value)} placeholder="WiFi SSID (or select above)" style={S.inp}/>
+            <input value={wifiPwd} onChange={e=>setWifiPwd(e.target.value)} placeholder="WiFi Password" type="password" style={S.inp}/>
+          </div>
+        </div>
+
+        {/* Connect to WiFi (cloud iotUrl) */}
+        <div style={{ ...S.card, borderColor:"#2563eb" }}>
+          <div style={{ ...S.lbl, color:"#60a5fa" }}>3. Connect to WiFi</div>
+          <p style={{ fontSize:11, color:"#94a3b8", margin:"4px 0 8px", lineHeight:1.5 }}>
+            Sends WiFi credentials with cloud MQTT endpoint.
+            For SF800/Hyper devices, block internet afterwards and use zenSDK locally.
+            {wifiSsid && wifiList.length > 0 && (() => {
+              const net = wifiList.find(n=>n.SSID===wifiSsid);
+              return net ? <span style={{color:"#4ade80"}}> (AM:{net.AM}, {net.signal}dBm)</span> : <span style={{color:"#f97316"}}> (SSID not in scan — AM will default to 7)</span>;
+            })()}
+          </p>
+          <div style={{ marginBottom:8 }}>
+            <div style={{ fontSize:10, color:"#64748b", marginBottom:4 }}>Cloud region (for iotUrl)</div>
+            <div style={{ display:"flex", gap:6 }}>
+              {Object.entries(CLOUD_BROKERS).map(([k,v])=>(
+                <button key={k} onClick={()=>setCloudRegion(k)} style={{
+                  ...S.btnMut, fontSize:10,
+                  background:cloudRegion===k?"#2563eb":"#1e293b",
+                  color:cloudRegion===k?"#fff":"#94a3b8",
+                  fontWeight:cloudRegion===k?600:400,
+                }}>{k.toUpperCase()}: {v}</button>
+              ))}
+            </div>
+          </div>
+          {confirmAction!=="wifi"
+            ? <button onClick={()=>setConfirmAction("wifi")} disabled={!isConn||!wifiSsid||!wifiPwd}
+                style={{ ...S.btnPri, opacity:isConn&&wifiSsid&&wifiPwd?1:0.4 }}>Connect to WiFi</button>
+            : <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+                <span style={{ fontSize:11, color:"#fbbf24" }}>Connect "{wifiSsid}"?</span>
+                <button onClick={sendWifiOnly} style={S.btnPri}>Yes, connect</button>
+                <button onClick={()=>setConfirmAction(null)} style={S.btnMut}>Cancel</button>
+              </div>}
+        </div>
+
+        {/* Disconnect from cloud → local MQTT */}
+        <div style={{ ...S.card, borderColor:"#991b1b" }}>
+          <div style={{ ...S.lbl, color:"#f87171" }}>Go Offline \u2192 Local MQTT</div>
+          <p style={{ fontSize:11, color:"#94a3b8", margin:"4px 0 8px", lineHeight:1.5 }}>
+            Connect WiFi but point iotUrl at your own MQTT broker instead of cloud.
+          </p>
+          <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:8 }}>
+            <input value={mqttBroker} onChange={e=>setMqttBroker(e.target.value)}
+              placeholder="Broker IP (e.g. 192.168.1.100)" style={{ ...S.inp, flex:1, minWidth:170 }}/>
+          </div>
+          {confirmAction!=="disconnect"
+            ? <button onClick={()=>setConfirmAction("disconnect")} disabled={!isConn||!wifiSsid||!wifiPwd}
+                style={{ ...S.btnDng, opacity:isConn&&wifiSsid&&wifiPwd?1:0.4 }}>Disconnect from Cloud</button>
+            : <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+                <span style={{ fontSize:11, color:"#fbbf24" }}>Hub will go offline. Sure?</span>
+                <button onClick={sendDisconnectFromCloud} style={S.btnDng}>Yes, go offline</button>
+                <button onClick={()=>setConfirmAction(null)} style={S.btnMut}>Cancel</button>
+              </div>}
+        </div>
+
+        {/* Reconnect to cloud */}
+        <div style={{ ...S.card, borderColor:"#166534" }}>
+          <div style={{ ...S.lbl, color:"#4ade80" }}>Go Online \u2192 Zendure Cloud</div>
+          <p style={{ fontSize:11, color:"#94a3b8", margin:"4px 0 8px", lineHeight:1.5 }}>
+            Restore cloud connectivity. Needed for firmware updates and app control.
+          </p>
+          {confirmAction!=="reconnect"
+            ? <button onClick={()=>setConfirmAction("reconnect")} disabled={!isConn||!wifiSsid||!wifiPwd}
+                style={{ ...S.btnSuc, opacity:isConn&&wifiSsid&&wifiPwd?1:0.4 }}>Reconnect to Cloud</button>
+            : <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+                <span style={{ fontSize:11, color:"#fbbf24" }}>Confirm reconnect?</span>
+                <button onClick={sendReconnectToCloud} style={S.btnSuc}>Yes, reconnect</button>
+                <button onClick={()=>setConfirmAction(null)} style={S.btnMut}>Cancel</button>
+              </div>}
+        </div>
+
+        <div style={{ fontSize:10, color:"#475569", marginTop:8, lineHeight:1.5 }}>
+          Protocol reverse-engineered from Wireshark captures of the Zendure app.
+          result:0 = success, result:1 = error. Check the Log tab for responses.
+        </div>
+      </div>}
+
+      {/* ===== Dashboard ===== */}
+      {tab==="dashboard" && <div>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:8 }}>
+          <Cv label="Solar In" value={props.solarInputPower} unit="W" color="#facc15"/>
+          <Cv label="Home Out" value={props.outputHomePower} unit="W" color="#22c55e"/>
+          <Cv label="Batt Charge" value={props.outputPackPower} unit="W" color="#3b82f6"/>
+          <Cv label="Batt Disch." value={props.packInputPower} unit="W" color="#f97316"/>
+        </div>
+
+        <div style={S.card}>
+          <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
+            <span style={{ color:"#94a3b8", fontSize:11 }}>Overall Battery</span>
+            <span style={{ fontWeight:700, color:"#facc15" }}>{props.electricLevel!=null?`${props.electricLevel}%`:"\u2014"}</span>
+          </div>
+          <div style={{ background:"#1e293b", borderRadius:4, height:8, overflow:"hidden" }}>
+            <div style={{ width:`${Math.min(props.electricLevel||0,100)}%`, height:"100%",
+              background:(props.electricLevel||0)>20?"linear-gradient(90deg,#22c55e,#4ade80)":"#ef4444",
+              borderRadius:4, transition:"width 0.5s" }}/>
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", marginTop:3, fontSize:10, color:"#64748b" }}>
+            <span>Min: {props.minSoc!=null?`${props.minSoc/10}%`:"\u2014"}</span>
+            <span>Max: {props.socSet!=null?`${props.socSet/10}%`:"\u2014"}</span>
+          </div>
+        </div>
+
+        {(props.solarPower1!=null||props.solarPower2!=null) &&
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:8 }}>
+            <Cv label="Panel 1" value={props.solarPower1} unit="W" color="#eab308" small/>
+            <Cv label="Panel 2" value={props.solarPower2} unit="W" color="#eab308" small/>
+          </div>}
+
+        <div style={{ ...S.card, display:"flex", flexWrap:"wrap", gap:12, fontSize:11 }}>
+          <St l="Limit" v={props.outputLimit!=null?`${props.outputLimit}W`:"\u2014"}/>
+          <St l="State" v={props.packState===0?"Idle":props.packState===1?"Charging":props.packState===2?"Discharging":"\u2014"}/>
+          <St l="WiFi" v={props.wifiState?"On":"Off"}/>
+          <St l="Pass" v={props.pass!=null?(props.pass?"Yes":"No"):"\u2014"}/>
+          {props.pvBrand!=null&&<St l="Inv" v={PV_BRANDS[props.pvBrand]||`#${props.pvBrand}`}/>}
+        </div>
+
+        {packList.length>0 && <div style={{marginTop:8}}>
+          <div style={S.lbl}>Battery Packs</div>
+          {packList.map(p=>(
+            <div key={p.sn} style={{ ...S.card, marginBottom:6 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", marginBottom:3 }}>
+                <span style={{ fontSize:10, color:"#94a3b8" }}>{p.sn}</span>
+                <span style={{ fontWeight:600 }}>{p.socLevel!=null?`${p.socLevel}%`:"\u2014"}{p.state===1?" \u26A1":p.state===2?" \uD83D\uDD0B":""}</span>
+              </div>
+              <div style={{ display:"flex", gap:10, fontSize:10, color:"#94a3b8", flexWrap:"wrap" }}>
+                {p.power!=null&&<span>{p.power}W</span>}
+                {p.maxTemp!=null&&<span>{tempC(p.maxTemp)}\u00B0C</span>}
+                {p.totalVol!=null&&<span>{(p.totalVol/100).toFixed(1)}V</span>}
+                {p.soh!=null&&<span>SoH:{p.soh}%</span>}
+              </div>
+            </div>
+          ))}
+        </div>}
+
+        {firmwares.length>0 && <div style={{...S.card,fontSize:10,marginTop:6}}>
+          <span style={{color:"#64748b"}}>FW: </span>
+          {firmwares.map((f,i)=><span key={i} style={{color:"#94a3b8"}}>{f.type} v{f.version}{i<firmwares.length-1?" \u00B7 ":""}</span>)}
+        </div>}
+
+        {isConn && <div style={{ display:"flex", gap:8, marginTop:10 }}>
+          <button onClick={sendGetInfo} style={S.btnMut}>Get Info</button>
+          <button onClick={sendGetAll} style={S.btnMut}>Refresh All</button>
+        </div>}
+      </div>}
+
+      {/* ===== Settings ===== */}
+      {tab==="settings" && <div>
+        {!isConn ? <div style={{color:"#64748b",padding:20,textAlign:"center",fontSize:12}}>Connect first</div> : <>
+
+          {/* WiFi / Network Status */}
+          <div style={S.card}>
+            <div style={S.lbl}>Network Status</div>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:12, fontSize:11 }}>
+              <St l="WiFi" v={props.wifiState===1?"Connected":props.wifiState===0?"Disconnected":"\u2014"}/>
+              {props.hubState!=null&&<St l="Hub State" v={props.hubState?"Auto-off":"Normal"}/>}
+              {props.masterSoftVersion!=null&&<St l="FW" v={props.masterSoftVersion}/>}
+            </div>
+            <div style={{marginTop:6}}>
+              <button onClick={sendGetAll} style={S.btnMut}>Refresh All</button>
+            </div>
+          </div>
+
+          {/* Output Limit */}
+          <div style={{marginBottom:14}}>
+            <div style={S.lbl}>Output Limit {props.outputLimit!=null?<span style={{color:"#facc15",fontWeight:400}}>({props.outputLimit}W)</span>:""}</div>
+            <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+              {[0,30,60,100,200,300,600,800,1200].map(v=>(
+                <button key={v} onClick={()=>quickSet("outputLimit",v)} style={{
+                  ...S.btnMut, minWidth:42,
+                  background:props.outputLimit===v?"#facc15":"#1e293b",
+                  color:props.outputLimit===v?"#0c0f14":"#e2e8f0",
+                }}>{v}W</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Input Limit */}
+          <div style={{marginBottom:14}}>
+            <div style={S.lbl}>Input Limit {props.inputLimit!=null?<span style={{color:"#60a5fa",fontWeight:400}}>({props.inputLimit}W)</span>:""}</div>
+            <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+              {[0,100,200,400,600,800,1200].map(v=>(
+                <button key={v} onClick={()=>quickSet("inputLimit",v)} style={{
+                  ...S.btnMut, minWidth:42,
+                  background:props.inputLimit===v?"#60a5fa":"#1e293b",
+                  color:props.inputLimit===v?"#0c0f14":"#e2e8f0",
+                }}>{v}W</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Min SoC */}
+          <div style={{marginBottom:14}}>
+            <div style={S.lbl}>Min SoC (Discharge floor) {props.minSoc!=null?<span style={{color:"#f97316",fontWeight:400}}>({props.minSoc/10}%)</span>:""}</div>
+            <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+              {[0,5,10,15,20,30,40,50].map(v=>(
+                <button key={v} onClick={()=>quickSet("minSoc",v*10)} style={{
+                  ...S.btnMut, minWidth:38,
+                  background:props.minSoc===v*10?"#f97316":"#1e293b",
+                  color:props.minSoc===v*10?"#0c0f14":"#e2e8f0",
+                }}>{v}%</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Max SoC */}
+          <div style={{marginBottom:14}}>
+            <div style={S.lbl}>Max SoC (Charge ceiling) {props.socSet!=null?<span style={{color:"#22c55e",fontWeight:400}}>({props.socSet/10}%)</span>:""}</div>
+            <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+              {[70,75,80,85,90,95,100].map(v=>(
+                <button key={v} onClick={()=>quickSet("socSet",v*10)} style={{
+                  ...S.btnMut, minWidth:38,
+                  background:props.socSet===v*10?"#22c55e":"#1e293b",
+                  color:props.socSet===v*10?"#0c0f14":"#e2e8f0",
+                }}>{v}%</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Bypass */}
+          <div style={{marginBottom:14}}>
+            <div style={S.lbl}>Bypass {props.passMode!=null?<span style={{color:"#94a3b8",fontWeight:400}}>({["Auto","Off","On"][props.passMode]||"?"})</span>:""}</div>
+            <div style={{ display:"flex", gap:5 }}>
+              {[["Auto",0],["Off",1],["On",2]].map(([l,v])=>(
+                <button key={v} onClick={()=>quickSet("passMode",v)} style={{
+                  ...S.btnMut, background:props.passMode===v?"#facc15":"#1e293b", color:props.passMode===v?"#0c0f14":"#e2e8f0",
+                }}>{l}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Buzzer */}
+          <div style={{marginBottom:14}}>
+            <div style={S.lbl}>Buzzer</div>
+            <div style={{ display:"flex", gap:5 }}>
+              <button onClick={()=>quickSet("buzzerSwitch",1)} style={{...S.btnMut,background:props.buzzerSwitch?"#facc15":"#1e293b",color:props.buzzerSwitch?"#0c0f14":"#e2e8f0"}}>On</button>
+              <button onClick={()=>quickSet("buzzerSwitch",0)} style={{...S.btnMut,background:!props.buzzerSwitch?"#facc15":"#1e293b",color:!props.buzzerSwitch?"#0c0f14":"#e2e8f0"}}>Off</button>
+            </div>
+          </div>
+
+          {/* Inverter brand & max power */}
+          <div style={S.card}>
+            <div style={S.lbl}>Inverter {props.pvBrand!=null?<span style={{color:"#94a3b8",fontWeight:400}}>({PV_BRANDS[props.pvBrand]||"?"}, {props.inverseMaxPower||"?"}W)</span>:""}</div>
+            <div style={{marginBottom:8}}>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Brand</div>
+              <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+                {PV_BRANDS.map((name,i)=>(
+                  <button key={i} onClick={()=>quickSet("pvBrand",i)} style={{
+                    ...S.btnMut, fontSize:10, padding:"4px 8px",
+                    background:props.pvBrand===i?"#facc15":"#1e293b",
+                    color:props.pvBrand===i?"#0c0f14":"#e2e8f0",
+                  }}>{name}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:10,color:"#64748b",marginBottom:4}}>Max Power</div>
+              <div style={{ display:"flex", gap:5, flexWrap:"wrap" }}>
+                {[100,200,300,400,600,800,1200,1600,2000].map(v=>(
+                  <button key={v} onClick={()=>quickSet("inverseMaxPower",v)} style={{
+                    ...S.btnMut, minWidth:40, fontSize:10, padding:"4px 8px",
+                    background:props.inverseMaxPower===v?"#facc15":"#1e293b",
+                    color:props.inverseMaxPower===v?"#0c0f14":"#e2e8f0",
+                  }}>{v}W</button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Custom Write */}
+          <div style={S.card}>
+            <div style={S.lbl}>Custom Write</div>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              <select value={writeField} onChange={e=>setWriteField(e.target.value)} style={S.inp}>
+                {["outputLimit","inputLimit","minSoc","socSet","buzzerSwitch","passMode","autoRecover","inverseMaxPower","pvBrand","hubState","masterSwitch","smartMode","smartPower","gridPower"].map(f=><option key={f} value={f}>{f}</option>)}
+              </select>
+              <input type="number" value={writeValue} onChange={e=>setWriteValue(e.target.value)} placeholder="Value" style={{...S.inp,width:72,flex:"none"}}/>
+              <button onClick={sendWrite} style={S.btnPri}>Write</button>
+            </div>
+            <div style={{fontSize:10,color:"#475569",marginTop:4}}>socSet/minSoc use 10x (700 = 70%)</div>
+          </div>
+
+          {/* Raw Properties JSON */}
+          <div style={S.card}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+              <div style={S.lbl}>All Properties (Raw)</div>
+              <button onClick={sendGetAll} style={{...S.btnMut,fontSize:10,padding:"3px 8px"}}>Refresh</button>
+            </div>
+            <div style={{ background:"#0f1219", border:"1px solid #1e293b", borderRadius:6, padding:8, fontSize:10,
+              maxHeight:300, overflowY:"auto", whiteSpace:"pre-wrap", wordBreak:"break-all", color:"#94a3b8", fontFamily:"inherit" }}>
+              {Object.keys(props).length>0 ? JSON.stringify(props, null, 2) : "No data yet — tap Refresh"}
+            </div>
+            {packList.length>0 && <>
+              <div style={{...S.lbl,marginTop:8}}>Pack Data (Raw)</div>
+              <div style={{ background:"#0f1219", border:"1px solid #1e293b", borderRadius:6, padding:8, fontSize:10,
+                maxHeight:200, overflowY:"auto", whiteSpace:"pre-wrap", wordBreak:"break-all", color:"#94a3b8", fontFamily:"inherit" }}>
+                {JSON.stringify(packs, null, 2)}
+              </div>
+            </>}
+          </div>
+        </>}
+      </div>}
+
+      {/* ===== Log ===== */}
+      {tab==="log" && <div>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+          <span style={{fontSize:11,color:"#64748b"}}>{log.length} msgs</span>
+          <button onClick={()=>setLog([])} style={S.btnMut}>Clear</button>
+        </div>
+        <div style={S.logBox}>
+          {log.length===0&&<span style={{color:"#475569"}}>No messages yet</span>}
+          {log.map((e,i)=>(
+            <div key={i} style={{wordBreak:"break-all",lineHeight:1.5}}>
+              <span style={{color:"#475569"}}>{e.t} </span>
+              <span style={{color:e.dir==="TX"?"#60a5fa":e.dir==="ERR"?"#ef4444":e.dir==="INFO"?"#fbbf24":"#4ade80",fontWeight:600}}>{e.dir}</span>{" "}
+              <span style={{color:"#cbd5e1"}}>{e.msg}</span>
+            </div>
+          ))}
+        </div>
+      </div>}
+
+      <div style={{textAlign:"center",marginTop:16,fontSize:9,color:"#1e293b"}}>Web BT Solarflow Manager</div>
+    </div>
+  );
+}
+
+function Cv({label,value,unit,color,small}) {
+  return <div style={S.card}>
+    <div style={{fontSize:small?10:11,color:"#64748b",marginBottom:1}}>{label}</div>
+    <div style={{fontSize:small?17:20,fontWeight:700,color:color||"#e2e8f0",lineHeight:1.2}}>
+      {value!=null?value:"\u2014"}
+      {value!=null&&<span style={{fontSize:10,fontWeight:400,color:"#94a3b8"}}> {unit}</span>}
+    </div>
+  </div>;
+}
+function St({l,v}) { return <div><span style={{color:"#64748b"}}>{l}: </span><span style={{color:"#e2e8f0"}}>{v}</span></div>; }
+
+const S = {
+  root: { fontFamily:"'JetBrains Mono','Fira Code','SF Mono',monospace", background:"#0c0f14", color:"#e2e8f0", minHeight:"100vh", padding:12, maxWidth:560, margin:"0 auto", fontSize:12 },
+  card: { background:"#151a23", border:"1px solid #1e293b", borderRadius:8, padding:"10px 12px", marginBottom:8 },
+  lbl: { fontSize:11, color:"#64748b", marginBottom:6, fontWeight:600 },
+  btnPri: { border:"none", borderRadius:6, padding:"6px 12px", cursor:"pointer", fontSize:11, fontFamily:"inherit", fontWeight:500, background:"#2563eb", color:"#fff" },
+  btnDng: { border:"none", borderRadius:6, padding:"6px 12px", cursor:"pointer", fontSize:11, fontFamily:"inherit", fontWeight:500, background:"#dc2626", color:"#fff" },
+  btnSuc: { border:"none", borderRadius:6, padding:"6px 12px", cursor:"pointer", fontSize:11, fontFamily:"inherit", fontWeight:500, background:"#16a34a", color:"#fff" },
+  btnMut: { border:"none", borderRadius:6, padding:"6px 12px", cursor:"pointer", fontSize:11, fontFamily:"inherit", fontWeight:500, background:"#1e293b", color:"#e2e8f0" },
+  inp: { background:"#1e293b", color:"#e2e8f0", border:"1px solid #334155", borderRadius:6, padding:"7px 10px", fontSize:12, fontFamily:"inherit", width:"100%", boxSizing:"border-box" },
+  warn: { background:"#451a03", border:"1px solid #92400e", borderRadius:6, padding:"8px 12px", marginBottom:12, fontSize:11, color:"#fbbf24" },
+  danger: { background:"#1c0a0a", border:"1px solid #7f1d1d", borderRadius:6, padding:"8px 12px", marginBottom:12, fontSize:11, color:"#fca5a5", lineHeight:1.5 },
+  logBox: { background:"#0f1219", border:"1px solid #1e293b", borderRadius:6, maxHeight:400, overflowY:"auto", padding:8, fontSize:10, fontFamily:"inherit" },
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
